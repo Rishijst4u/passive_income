@@ -7,6 +7,7 @@ from typing import Callable
 import pandas as pd
 
 from .config import Settings, load_settings
+from .costs import CostSettings, calculate_trade_costs
 from .risk import (
     RiskState,
     check_entry,
@@ -28,14 +29,39 @@ class Trade:
     symbol: str
     signal_time: object
     entry_time: object
+
     entry: float
     stop: float
     target: float
     quantity: int
+
     exit_time: object
     exit: float
-    pnl: float
+
+    gross_pnl: float
+    total_cost: float
+    net_pnl: float
+
+    brokerage: float
+    stt: float
+    exchange_transaction_charges: float
+    sebi_charges: float
+    stamp_duty: float
+    gst: float
+    ipft: float
+    slippage: float
+
     reason: str
+
+    @property
+    def pnl(self) -> float:
+        """
+        Backward-compatible P&L property.
+
+        Returns net P&L because risk and portfolio performance
+        should use the amount actually retained after trading costs.
+        """
+        return self.net_pnl
 
 
 @dataclass(frozen=True)
@@ -85,13 +111,18 @@ def _close(
     timestamp,
     price: float,
     reason: str,
+    cost_settings: CostSettings,
 ) -> Trade:
-    """Close a position and calculate gross P&L."""
+    """Close a position and calculate gross P&L, costs and net P&L."""
+
     exit_price = float(price)
 
-    pnl = (
-        exit_price - position.entry
-    ) * position.quantity
+    costs = calculate_trade_costs(
+        entry_price=position.entry,
+        exit_price=exit_price,
+        quantity=position.quantity,
+        settings=cost_settings,
+    )
 
     return Trade(
         symbol=position.signal.symbol,
@@ -103,7 +134,17 @@ def _close(
         quantity=position.quantity,
         exit_time=timestamp,
         exit=exit_price,
-        pnl=pnl,
+        gross_pnl=costs.gross_pnl,
+        total_cost=costs.total_cost,
+        net_pnl=costs.net_pnl,
+        brokerage=costs.brokerage,
+        stt=costs.stt,
+        exchange_transaction_charges=costs.exchange_transaction_charges,
+        sebi_charges=costs.sebi_charges,
+        stamp_duty=costs.stamp_duty,
+        gst=costs.gst,
+        ipft=costs.ipft,
+        slippage=costs.slippage,
         reason=reason,
     )
 
@@ -113,6 +154,7 @@ def run_backtest(
     symbol: str = "TEST",
     settings: Settings | None = None,
     signal_generator: SignalGenerator = generate_signal,
+    cost_settings: CostSettings | None = None,
 ) -> BacktestResult:
     """
     Run the deterministic baseline backtest.
@@ -125,8 +167,12 @@ def run_backtest(
     - No overnight positions are allowed.
     - Stop/target ambiguity is resolved conservatively in favour of the stop.
     - Position sizing is delegated to the deterministic risk engine.
+    - Trading costs are calculated when a position is closed.
+    - Both gross P&L and net P&L are preserved.
     """
+
     settings = settings or load_settings()
+    cost_settings = cost_settings or CostSettings()
 
     if df.empty:
         return BacktestResult(
@@ -176,10 +222,11 @@ def run_backtest(
                     timestamp=previous_timestamp,
                     price=previous_close,
                     reason="SESSION_CLOSE",
+                    cost_settings=cost_settings,
                 )
 
                 trades.append(trade)
-                record_exit(risk_state, trade.pnl)
+                record_exit(risk_state, trade.net_pnl)
 
                 position = None
 
@@ -263,10 +310,11 @@ def run_backtest(
                     timestamp=timestamp,
                     price=position.stop,
                     reason="STOP_TARGET_AMBIGUITY_STOP",
+                    cost_settings=cost_settings,
                 )
 
                 trades.append(trade)
-                record_exit(risk_state, trade.pnl)
+                record_exit(risk_state, trade.net_pnl)
                 position = None
 
             elif stop_hit:
@@ -275,10 +323,11 @@ def run_backtest(
                     timestamp=timestamp,
                     price=position.stop,
                     reason="STOP",
+                    cost_settings=cost_settings,
                 )
 
                 trades.append(trade)
-                record_exit(risk_state, trade.pnl)
+                record_exit(risk_state, trade.net_pnl)
                 position = None
 
             elif target_hit:
@@ -287,10 +336,11 @@ def run_backtest(
                     timestamp=timestamp,
                     price=position.target,
                     reason="TARGET",
+                    cost_settings=cost_settings,
                 )
 
                 trades.append(trade)
-                record_exit(risk_state, trade.pnl)
+                record_exit(risk_state, trade.net_pnl)
                 position = None
 
             # Session-close protection.
@@ -302,10 +352,11 @@ def run_backtest(
                     timestamp=timestamp,
                     price=close_price,
                     reason="SESSION_CLOSE",
+                    cost_settings=cost_settings,
                 )
 
                 trades.append(trade)
-                record_exit(risk_state, trade.pnl)
+                record_exit(risk_state, trade.net_pnl)
                 position = None
 
         # ---------------------------------------------------------
@@ -341,10 +392,11 @@ def run_backtest(
             timestamp=final_timestamp,
             price=final_close,
             reason="SESSION_CLOSE",
+            cost_settings=cost_settings,
         )
 
         trades.append(trade)
-        record_exit(risk_state, trade.pnl)
+        record_exit(risk_state, trade.net_pnl)
 
         position = None
 

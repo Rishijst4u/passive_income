@@ -1,0 +1,16 @@
+capital: 50000
+max_risk_per_trade_pct: 0.5
+max_position_value: 10000
+max_daily_loss_pct: 1.0
+max_trades_per_day: 3
+risk_reward_min: 2.0
+timeframe: 5m
+entry_start: "09:30"
+entry_end: "14:30"
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_min: 55
+  rsi_max: 70
+  volume_ratio_min: 1.5
+  breakout_lookback: 3

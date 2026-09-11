@@ -133,21 +133,25 @@ def normalize_ohlcv(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
 def _count_missing_session_bars(
     timestamps: pd.Series, calendar: TradingCalendar
 ) -> int:
+    valid_timestamps = timestamps.dropna()
+    if valid_timestamps.empty:
+        return 0
+
+    observed = set(valid_timestamps)
     missing_bars = 0
-    for previous, current in zip(timestamps.iloc[:-1], timestamps.iloc[1:]):
-        if pd.isna(previous) or pd.isna(current) or current <= previous:
+    for trading_date in pd.date_range(
+        valid_timestamps.min().date(), valid_timestamps.max().date(), freq="D"
+    ).date:
+        if not calendar.is_trading_day(trading_date):
             continue
-        for trading_date in pd.date_range(previous.date(), current.date(), freq="D").date:
-            if not calendar.is_trading_day(trading_date):
-                continue
-            session_start = pd.Timestamp.combine(trading_date, NSE_SESSION_START).tz_localize(
-                ASIA_KOLKATA
-            )
-            session_end = pd.Timestamp.combine(trading_date, NSE_SESSION_END).tz_localize(
-                ASIA_KOLKATA
-            )
-            expected_bars = pd.date_range(session_start, session_end, freq="5min")
-            missing_bars += sum(previous < expected < current for expected in expected_bars)
+        session_start = pd.Timestamp.combine(trading_date, NSE_SESSION_START).tz_localize(
+            ASIA_KOLKATA
+        )
+        session_end = pd.Timestamp.combine(trading_date, NSE_SESSION_END).tz_localize(
+            ASIA_KOLKATA
+        )
+        expected_bars = pd.date_range(session_start, session_end, freq="5min")
+        missing_bars += sum(expected not in observed for expected in expected_bars)
     return missing_bars
 
 

@@ -30,6 +30,23 @@ def raw_frame():
     )
 
 
+def complete_session_frame(trading_date="2026-01-05"):
+    timestamps = pd.date_range(
+        f"{trading_date} 09:15", f"{trading_date} 15:30", freq="5min"
+    )
+    prices = pd.Series(range(100, 100 + len(timestamps)), dtype=float)
+    return pd.DataFrame(
+        {
+            "Open": prices.to_numpy(),
+            "High": (prices + 1).to_numpy(),
+            "Low": (prices - 1).to_numpy(),
+            "Close": (prices + 0.5).to_numpy(),
+            "Volume": [1000] * len(timestamps),
+        },
+        index=timestamps,
+    )
+
+
 def test_normalizes_schema_and_naive_timestamps_to_kolkata():
     normalized = normalize_ohlcv(raw_frame(), "reliance.ns")
 
@@ -99,17 +116,49 @@ def test_negative_volume_is_rejected():
 
 
 def test_holiday_between_sessions_does_not_create_a_gap():
-    frame = raw_frame().iloc[:2].copy()
-    frame.index = pd.DatetimeIndex(["2026-01-23 15:30", "2026-01-27 09:15"])
+    frame = pd.concat([
+        complete_session_frame("2026-01-23"),
+        complete_session_frame("2026-01-27"),
+    ])
 
     report = validate_ohlcv(normalize_ohlcv(frame, "TCS"))
 
     assert report.detected_gaps == 0
 
 
-def test_unexpected_intraday_gap_is_reported():
-    frame = raw_frame().iloc[:2].copy()
-    frame.index = pd.DatetimeIndex(["2026-01-05 09:15", "2026-01-05 09:25"])
+def test_weekend_between_sessions_does_not_create_a_gap():
+    frame = pd.concat([
+        complete_session_frame("2026-01-02"),
+        complete_session_frame("2026-01-05"),
+    ])
+
+    report = validate_ohlcv(normalize_ohlcv(frame, "TCS"))
+
+    assert report.detected_gaps == 0
+
+
+def test_missing_middle_session_candle_is_reported():
+    frame = complete_session_frame().drop(
+        pd.Timestamp("2026-01-05 12:00")
+    )
+
+    with pytest.raises(DataValidationError) as error:
+        validate_ohlcv(normalize_ohlcv(frame, "TCS"))
+
+    assert error.value.report.detected_gaps == 1
+
+
+def test_missing_first_session_candle_is_reported():
+    frame = complete_session_frame().iloc[1:]
+
+    with pytest.raises(DataValidationError) as error:
+        validate_ohlcv(normalize_ohlcv(frame, "TCS"))
+
+    assert error.value.report.detected_gaps == 1
+
+
+def test_missing_final_session_candle_is_reported():
+    frame = complete_session_frame().iloc[:-1]
 
     with pytest.raises(DataValidationError) as error:
         validate_ohlcv(normalize_ohlcv(frame, "TCS"))
@@ -129,12 +178,12 @@ def test_non_numeric_ohlcv_value_is_reported_as_missing():
 
 
 def test_valid_data_is_accepted_with_deterministic_quality_report():
-    normalized = normalize_ohlcv(raw_frame(), "TCS")
+    normalized = normalize_ohlcv(complete_session_frame(), "TCS")
 
     report = validate_ohlcv(normalized)
 
-    assert report.rows == 3
+    assert report.rows == 76
     assert report.first_timestamp == pd.Timestamp("2026-01-05 09:15", tz=ASIA_KOLKATA)
-    assert report.last_timestamp == pd.Timestamp("2026-01-05 09:25", tz=ASIA_KOLKATA)
+    assert report.last_timestamp == pd.Timestamp("2026-01-05 15:30", tz=ASIA_KOLKATA)
     assert report.detected_gaps == 0
     assert report == build_quality_report(normalized)

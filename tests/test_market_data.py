@@ -8,6 +8,10 @@ from src.market_data import (
     normalize_ohlcv,
     validate_ohlcv,
 )
+from src.trading_calendar import (
+    DEFAULT_NSE_TRADING_CALENDAR,
+    TradingDayType,
+)
 
 
 def raw_frame():
@@ -45,6 +49,18 @@ def test_normalizes_utc_timestamps_to_kolkata():
     assert normalized.iloc[0]["timestamp"] == pd.Timestamp("2026-01-05 14:45", tz=ASIA_KOLKATA)
 
 
+def test_calendar_identifies_weekends():
+    assert DEFAULT_NSE_TRADING_CALENDAR.day_type(pd.Timestamp("2026-01-24").date()) is TradingDayType.WEEKEND
+
+
+def test_calendar_identifies_known_nse_holidays():
+    assert DEFAULT_NSE_TRADING_CALENDAR.day_type(pd.Timestamp("2026-01-26").date()) is TradingDayType.MARKET_HOLIDAY
+
+
+def test_calendar_identifies_normal_trading_days():
+    assert DEFAULT_NSE_TRADING_CALENDAR.day_type(pd.Timestamp("2026-01-27").date()) is TradingDayType.TRADING_DAY
+
+
 def test_missing_required_column_is_rejected():
     frame = raw_frame().drop(columns="Volume")
 
@@ -80,6 +96,25 @@ def test_negative_volume_is_rejected():
         validate_ohlcv(normalize_ohlcv(frame, "TCS"))
 
     assert error.value.report.negative_volume == 1
+
+
+def test_holiday_between_sessions_does_not_create_a_gap():
+    frame = raw_frame().iloc[:2].copy()
+    frame.index = pd.DatetimeIndex(["2026-01-23 15:30", "2026-01-27 09:15"])
+
+    report = validate_ohlcv(normalize_ohlcv(frame, "TCS"))
+
+    assert report.detected_gaps == 0
+
+
+def test_unexpected_intraday_gap_is_reported():
+    frame = raw_frame().iloc[:2].copy()
+    frame.index = pd.DatetimeIndex(["2026-01-05 09:15", "2026-01-05 09:25"])
+
+    with pytest.raises(DataValidationError) as error:
+        validate_ohlcv(normalize_ohlcv(frame, "TCS"))
+
+    assert error.value.report.detected_gaps == 1
 
 
 def test_non_numeric_ohlcv_value_is_reported_as_missing():

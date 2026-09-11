@@ -1,0 +1,19 @@
+name: paper-daily
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron is UTC. This is a placeholder and will be changed
+    # once the live-data ingestion schedule is implemented.
+    - cron: "30 4 * * 1-5"
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python -m src.cli backtest

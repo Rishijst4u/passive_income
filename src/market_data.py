@@ -6,12 +6,12 @@ from pathlib import Path
 from typing import Protocol
 
 import pandas as pd
+from .trading_calendar import DEFAULT_NSE_TRADING_CALENDAR, TradingCalendar
 
 
 ASIA_KOLKATA = "Asia/Kolkata"
 NSE_SESSION_START = time(9, 15)
 NSE_SESSION_END = time(15, 30)
-FIVE_MINUTES_NS = 5 * 60 * 1_000_000_000
 OHLCV_COLUMNS = ("timestamp", "symbol", "open", "high", "low", "close", "volume")
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
@@ -130,7 +130,32 @@ def normalize_ohlcv(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return normalized.loc[:, OHLCV_COLUMNS]
 
 
-def build_quality_report(frame: pd.DataFrame, interval: str = "5m") -> DataQualityReport:
+def _count_missing_session_bars(
+    timestamps: pd.Series, calendar: TradingCalendar
+) -> int:
+    missing_bars = 0
+    for previous, current in zip(timestamps.iloc[:-1], timestamps.iloc[1:]):
+        if pd.isna(previous) or pd.isna(current) or current <= previous:
+            continue
+        for trading_date in pd.date_range(previous.date(), current.date(), freq="D").date:
+            if not calendar.is_trading_day(trading_date):
+                continue
+            session_start = pd.Timestamp.combine(trading_date, NSE_SESSION_START).tz_localize(
+                ASIA_KOLKATA
+            )
+            session_end = pd.Timestamp.combine(trading_date, NSE_SESSION_END).tz_localize(
+                ASIA_KOLKATA
+            )
+            expected_bars = pd.date_range(session_start, session_end, freq="5min")
+            missing_bars += sum(previous < expected < current for expected in expected_bars)
+    return missing_bars
+
+
+def build_quality_report(
+    frame: pd.DataFrame,
+    interval: str = "5m",
+    calendar: TradingCalendar = DEFAULT_NSE_TRADING_CALENDAR,
+) -> DataQualityReport:
     if interval != "5m":
         raise ValueError("Only 5m OHLCV validation is supported in this milestone")
     missing_columns = [column for column in OHLCV_COLUMNS if column not in frame.columns]
@@ -150,16 +175,14 @@ def build_quality_report(frame: pd.DataFrame, interval: str = "5m") -> DataQuali
 
     local_time = timestamps.dt.time
     out_of_session = (
-        (timestamps.dt.dayofweek >= 5)
+        ~timestamps.dt.date.map(
+            lambda trading_date: calendar.is_trading_day(trading_date)
+            if pd.notna(trading_date) else False
+        )
         | (local_time < NSE_SESSION_START)
         | (local_time > NSE_SESSION_END)
     )
-    detected_gaps = sum(
-        current.date() == previous.date()
-        and pd.Timestamp(current).value - pd.Timestamp(previous).value > FIVE_MINUTES_NS
-        for previous, current in zip(timestamps.iloc[:-1], timestamps.iloc[1:])
-        if not pd.isna(previous) and not pd.isna(current)
-    )
+    detected_gaps = _count_missing_session_bars(timestamps, calendar)
 
     return DataQualityReport(
         rows=len(frame),
@@ -176,8 +199,12 @@ def build_quality_report(frame: pd.DataFrame, interval: str = "5m") -> DataQuali
     )
 
 
-def validate_ohlcv(frame: pd.DataFrame, interval: str = "5m") -> DataQualityReport:
-    report = build_quality_report(frame, interval)
+def validate_ohlcv(
+    frame: pd.DataFrame,
+    interval: str = "5m",
+    calendar: TradingCalendar = DEFAULT_NSE_TRADING_CALENDAR,
+) -> DataQualityReport:
+    report = build_quality_report(frame, interval, calendar)
     if not report.is_valid:
         raise DataValidationError(report)
     return report
@@ -197,6 +224,7 @@ def ingest_market_data(
     end: str | datetime | date,
     interval: str = "5m",
     data_root: Path = DATA_ROOT,
+    calendar: TradingCalendar = DEFAULT_NSE_TRADING_CALENDAR,
 ) -> IngestionResult:
     """Download, retain raw data, validate normalized data, then write Parquet."""
     if interval != "5m":
@@ -212,7 +240,7 @@ def ingest_market_data(
     raw.to_parquet(raw_path, engine="pyarrow", index=True)
 
     normalized = normalize_ohlcv(raw, source_symbol)
-    report = validate_ohlcv(normalized, interval)
+    report = validate_ohlcv(normalized, interval, calendar)
     processed_path.parent.mkdir(parents=True, exist_ok=True)
     normalized.to_parquet(processed_path, engine="pyarrow", index=False)
     return IngestionResult(raw_path, processed_path, report)

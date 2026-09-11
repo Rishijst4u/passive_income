@@ -1,4 +1,5 @@
 """Deterministic baseline execution engine for Experiment #001."""
+
 from dataclasses import dataclass
 from datetime import time
 from typing import Callable
@@ -6,21 +7,24 @@ from typing import Callable
 import pandas as pd
 
 from .config import Settings, load_settings
+from .risk import (
+    RiskState,
+    check_entry,
+    record_entry,
+    record_exit,
+    reset_day,
+)
 from .strategy import Signal, generate_signal
+
 
 ASIA_KOLKATA = "Asia/Kolkata"
 SESSION_CLOSE = time(15, 30)
 
 
-@dataclass(frozen=True)
-class PositionSize:
-    quantity: int
-    risk_per_share: float
-    planned_risk: float
-
-
 @dataclass
 class Trade:
+    """Completed paper trade."""
+
     symbol: str
     signal_time: object
     entry_time: object
@@ -36,6 +40,8 @@ class Trade:
 
 @dataclass(frozen=True)
 class RejectedSignal:
+    """Signal rejected by deterministic execution/risk controls."""
+
     symbol: str
     timestamp: object
     reason: str
@@ -43,12 +49,16 @@ class RejectedSignal:
 
 @dataclass(frozen=True)
 class BacktestResult:
+    """Complete backtest output."""
+
     trades: list[Trade]
     rejected_signals: list[RejectedSignal]
 
 
 @dataclass
 class _OpenPosition:
+    """Internal representation of an open position."""
+
     signal: Signal
     entry_time: object
     entry: float
@@ -60,116 +70,302 @@ class _OpenPosition:
 SignalGenerator = Callable[[pd.DataFrame, str, Settings], Signal | None]
 
 
-def calculate_position_size(entry: float, stop: float, settings: Settings) -> PositionSize:
-    """Size integer shares under configured risk and position-value limits."""
-    risk_per_share = entry - stop
-    if risk_per_share <= 0 or entry <= 0:
-        return PositionSize(0, risk_per_share, 0.0)
-    max_risk = settings.capital * settings.max_risk_per_trade_pct / 100
-    quantity = max(0, min(int(max_risk // risk_per_share), int(settings.max_position_value // entry)))
-    return PositionSize(quantity, risk_per_share, quantity * risk_per_share)
-
-
-def _local_timestamp(timestamp: object) -> pd.Timestamp:
+def _local_timestamp(timestamp):
+    """Return timestamp normalized to Asia/Kolkata."""
     value = pd.Timestamp(timestamp)
-    return value.tz_localize(ASIA_KOLKATA) if value.tzinfo is None else value.tz_convert(ASIA_KOLKATA)
+
+    if value.tzinfo is None:
+        return value.tz_localize(ASIA_KOLKATA)
+
+    return value.tz_convert(ASIA_KOLKATA)
 
 
-def _entry_allowed(timestamp: object, settings: Settings) -> bool:
-    current = _local_timestamp(timestamp).time()
-    return time.fromisoformat(settings.entry_start) <= current <= time.fromisoformat(settings.entry_end)
+def _close(
+    position: _OpenPosition,
+    timestamp,
+    price: float,
+    reason: str,
+) -> Trade:
+    """Close a position and calculate gross P&L."""
+    exit_price = float(price)
 
+    pnl = (
+        exit_price - position.entry
+    ) * position.quantity
 
-def _close(position: _OpenPosition, timestamp: object, price: float, reason: str) -> Trade:
-    return Trade(position.signal.symbol, position.signal.timestamp, position.entry_time,
-                 position.entry, position.stop, position.target, position.quantity,
-                 timestamp, price, (price - position.entry) * position.quantity, reason)
+    return Trade(
+        symbol=position.signal.symbol,
+        signal_time=position.signal.timestamp,
+        entry_time=position.entry_time,
+        entry=position.entry,
+        stop=position.stop,
+        target=position.target,
+        quantity=position.quantity,
+        exit_time=timestamp,
+        exit=exit_price,
+        pnl=pnl,
+        reason=reason,
+    )
 
 
 def run_backtest(
-    df: pd.DataFrame, symbol: str = "TEST", settings: Settings | None = None,
+    df: pd.DataFrame,
+    symbol: str = "TEST",
+    settings: Settings | None = None,
     signal_generator: SignalGenerator = generate_signal,
 ) -> BacktestResult:
-    """Enter at the next bar open; ambiguous stop/target bars conservatively stop out."""
+    """
+    Run the deterministic baseline backtest.
+
+    Execution assumptions:
+    - Strategy signals are generated from the current bar.
+    - A signal enters at the NEXT bar open.
+    - Risk controls are evaluated using the actual entry timestamp.
+    - Only one position can be open at a time.
+    - No overnight positions are allowed.
+    - Stop/target ambiguity is resolved conservatively in favour of the stop.
+    - Position sizing is delegated to the deterministic risk engine.
+    """
     settings = settings or load_settings()
+
+    if df.empty:
+        return BacktestResult(
+            trades=[],
+            rejected_signals=[],
+        )
+
+    data = df.copy()
+
+    if "timestamp" in data.columns:
+        data["timestamp"] = pd.to_datetime(data["timestamp"])
+
+    data = data.sort_values("timestamp").reset_index(drop=True)
+
     trades: list[Trade] = []
     rejected: list[RejectedSignal] = []
+
+    risk_state = RiskState()
     position: _OpenPosition | None = None
-    pending: Signal | None = None
-    daily_pnl: dict[object, float] = {}
-    daily_trades: dict[object, int] = {}
+    pending_signal: Signal | None = None
 
-    for i in range(len(df)):
-        bar, timestamp = df.iloc[i], _local_timestamp(df.index[i])
-        day = timestamp.date()
+    current_date = None
 
-        if position and _local_timestamp(position.entry_time).date() != day:
-            previous_time = _local_timestamp(df.index[i - 1])
-            trade = _close(position, previous_time, float(df.iloc[i - 1].close), "SESSION_CLOSE")
-            trades.append(trade)
-            daily_pnl[previous_time.date()] = daily_pnl.get(previous_time.date(), 0.0) + trade.pnl
-            position = None
+    for i in range(len(data)):
+        row = data.iloc[i]
 
-        if pending:
-            signal, pending = pending, None
-            entry, stop = float(bar.open), float(signal.stop)
-            size = calculate_position_size(entry, stop, settings)
-            max_daily_loss = settings.capital * settings.max_daily_loss_pct / 100
-            if timestamp.date() != _local_timestamp(signal.timestamp).date():
-                reason = "NO_OVERNIGHT_ENTRY"
-            elif not _entry_allowed(timestamp, settings):
-                reason = "OUTSIDE_ENTRY_WINDOW"
-            elif position:
-                reason = "POSITION_OPEN"
-            elif size.quantity == 0:
-                reason = "INVALID_POSITION_SIZE"
-            elif daily_trades.get(day, 0) >= settings.max_trades_per_day:
-                reason = "MAX_TRADES_PER_DAY"
-            elif daily_pnl.get(day, 0.0) - size.planned_risk < -max_daily_loss:
-                reason = "DAILY_LOSS_LIMIT"
-            else:
-                target = entry + settings.risk_reward_min * size.risk_per_share
-                position = _OpenPosition(signal, timestamp, entry, stop, target, size.quantity)
-                daily_trades[day] = daily_trades.get(day, 0) + 1
-                reason = None
-            if reason:
-                rejected.append(RejectedSignal(symbol, signal.timestamp, reason))
+        timestamp = _local_timestamp(row["timestamp"])
+        trading_date = timestamp.date()
 
-        if position:
-            stop_hit, target_hit = float(bar.low) <= position.stop, float(bar.high) >= position.target
-            if stop_hit and target_hit:
-                trade = _close(position, timestamp, position.stop, "STOP_TARGET_AMBIGUITY_STOP")
-            elif stop_hit:
-                trade = _close(position, timestamp, position.stop, "STOP")
-            elif target_hit:
-                trade = _close(position, timestamp, position.target, "TARGET")
-            elif timestamp.time() >= SESSION_CLOSE:
-                trade = _close(position, timestamp, float(bar.close), "SESSION_CLOSE")
-            else:
-                trade = None
-            if trade:
+        # ---------------------------------------------------------
+        # New trading day
+        # ---------------------------------------------------------
+        if current_date is None:
+            current_date = trading_date
+
+        elif trading_date != current_date:
+            # No overnight positions are permitted.
+            if position is not None:
+                previous_timestamp = _local_timestamp(
+                    data.iloc[i - 1]["timestamp"]
+                )
+
+                previous_close = float(data.iloc[i - 1]["close"])
+
+                trade = _close(
+                    position=position,
+                    timestamp=previous_timestamp,
+                    price=previous_close,
+                    reason="SESSION_CLOSE",
+                )
+
                 trades.append(trade)
-                daily_pnl[day] = daily_pnl.get(day, 0.0) + trade.pnl
+                record_exit(risk_state, trade.pnl)
+
                 position = None
 
-        signal = signal_generator(df.iloc[: i + 1], symbol, settings)
-        if not signal:
-            continue
-        if i == len(df) - 1:
-            rejected.append(RejectedSignal(symbol, signal.timestamp, "NO_NEXT_BAR"))
-        elif not _entry_allowed(signal.timestamp, settings):
-            rejected.append(RejectedSignal(symbol, signal.timestamp, "OUTSIDE_ENTRY_WINDOW"))
-        elif position or pending:
-            rejected.append(RejectedSignal(symbol, signal.timestamp, "POSITION_OPEN"))
-        else:
-            pending = signal
+            pending_signal = None
+            reset_day(risk_state)
+            current_date = trading_date
 
-    if position:
-        final_time = _local_timestamp(df.index[-1])
-        trades.append(_close(position, final_time, float(df.iloc[-1].close), "SESSION_CLOSE"))
-    return BacktestResult(trades, rejected)
+        # ---------------------------------------------------------
+        # Enter pending signal at current bar OPEN
+        # ---------------------------------------------------------
+        if pending_signal is not None and position is None:
+            entry_time = timestamp
+            entry_price = float(row["open"])
+
+            signal = pending_signal
+
+            # Signal's stop is calculated by the strategy.
+            stop_price = float(signal.stop)
+
+            risk_decision = check_entry(
+                timestamp=entry_time,
+                entry=entry_price,
+                stop=stop_price,
+                settings=settings,
+                state=risk_state,
+            )
+
+            if not risk_decision.approved:
+                rejected.append(
+                    RejectedSignal(
+                        symbol=symbol,
+                        timestamp=signal.timestamp,
+                        reason=risk_decision.reason,
+                    )
+                )
+
+                pending_signal = None
+
+            else:
+                position_size = risk_decision.position_size
+
+                risk_per_share = position_size.risk_per_share
+
+                target_price = (
+                    entry_price
+                    + (
+                        risk_per_share
+                        * settings.risk_reward_min
+                    )
+                )
+
+                position = _OpenPosition(
+                    signal=signal,
+                    entry_time=entry_time,
+                    entry=entry_price,
+                    stop=stop_price,
+                    target=target_price,
+                    quantity=position_size.quantity,
+                )
+
+                record_entry(risk_state)
+
+                pending_signal = None
+
+        # ---------------------------------------------------------
+        # Manage open position
+        # ---------------------------------------------------------
+        if position is not None:
+            high = float(row["high"])
+            low = float(row["low"])
+
+            stop_hit = low <= position.stop
+            target_hit = high >= position.target
+
+            # Conservative handling:
+            # If both levels were touched in the same candle,
+            # assume the stop was hit first.
+            if stop_hit and target_hit:
+                trade = _close(
+                    position=position,
+                    timestamp=timestamp,
+                    price=position.stop,
+                    reason="STOP_TARGET_AMBIGUITY_STOP",
+                )
+
+                trades.append(trade)
+                record_exit(risk_state, trade.pnl)
+                position = None
+
+            elif stop_hit:
+                trade = _close(
+                    position=position,
+                    timestamp=timestamp,
+                    price=position.stop,
+                    reason="STOP",
+                )
+
+                trades.append(trade)
+                record_exit(risk_state, trade.pnl)
+                position = None
+
+            elif target_hit:
+                trade = _close(
+                    position=position,
+                    timestamp=timestamp,
+                    price=position.target,
+                    reason="TARGET",
+                )
+
+                trades.append(trade)
+                record_exit(risk_state, trade.pnl)
+                position = None
+
+            # Session-close protection.
+            elif timestamp.time() >= SESSION_CLOSE:
+                close_price = float(row["close"])
+
+                trade = _close(
+                    position=position,
+                    timestamp=timestamp,
+                    price=close_price,
+                    reason="SESSION_CLOSE",
+                )
+
+                trades.append(trade)
+                record_exit(risk_state, trade.pnl)
+                position = None
+
+        # ---------------------------------------------------------
+        # Generate signal for NEXT bar
+        # ---------------------------------------------------------
+        if position is None and pending_signal is None:
+            signal = signal_generator(
+                data.iloc[: i + 1],
+                symbol,
+                settings,
+            )
+
+            if signal is not None:
+                # A signal on the final bar cannot be executed because
+                # there is no next bar.
+                if i < len(data) - 1:
+                    pending_signal = signal
+
+    # -------------------------------------------------------------
+    # Force-close any remaining position at final available close.
+    # -------------------------------------------------------------
+    if position is not None:
+        final_row = data.iloc[-1]
+
+        final_timestamp = _local_timestamp(
+            final_row["timestamp"]
+        )
+
+        final_close = float(final_row["close"])
+
+        trade = _close(
+            position=position,
+            timestamp=final_timestamp,
+            price=final_close,
+            reason="SESSION_CLOSE",
+        )
+
+        trades.append(trade)
+        record_exit(risk_state, trade.pnl)
+
+        position = None
+
+    return BacktestResult(
+        trades=trades,
+        rejected_signals=rejected,
+    )
 
 
-def run_simple_backtest(df: pd.DataFrame, symbol="TEST") -> list[Trade]:
-    """Compatibility wrapper for the existing CLI and dashboard."""
-    return run_backtest(df, symbol).trades
+def run_simple_backtest(
+    df: pd.DataFrame,
+    symbol: str = "TEST",
+    settings: Settings | None = None,
+) -> list[Trade]:
+    """
+    Backward-compatible helper returning only completed trades.
+    """
+    result = run_backtest(
+        df=df,
+        symbol=symbol,
+        settings=settings,
+    )
+
+    return result.trades

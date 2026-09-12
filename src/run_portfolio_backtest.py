@@ -1,4 +1,4 @@
-"""Run the shared-account portfolio backtest for Experiment #001."""
+"""Run the shared-account portfolio backtest for Strategy #002."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ from .report import rejected_signals_to_dataframe, trades_to_dataframe
 DEFAULT_DATA_ROOT = Path("data") / "processed"
 DEFAULT_OUTPUT_DIR = Path("data") / "reports"
 DEFAULT_INTERVAL = "5m"
+
+STRATEGY_NAME = "Trend + VWAP Pullback + Confirmation v2"
+EXPERIMENT_NAME = "EXPERIMENT #001 — STRATEGY #002"
 
 
 def load_processed_data(
@@ -138,6 +141,7 @@ def build_summary(
         )
 
     ending_capital = starting_capital + net_pnl
+
     return_pct = (
         net_pnl / starting_capital * 100.0
         if starting_capital > 0
@@ -147,7 +151,8 @@ def build_summary(
     return pd.DataFrame(
         [
             {
-                "strategy": "VWAP + Momentum + Volume Breakout v1",
+                "experiment": EXPERIMENT_NAME,
+                "strategy": STRATEGY_NAME,
                 "mode": "Portfolio historical backtest",
                 "starting_capital": starting_capital,
                 "ending_capital": ending_capital,
@@ -216,10 +221,10 @@ def run(
 
     print()
     print("=" * 60)
-    print("EXPERIMENT #001 — PORTFOLIO BACKTEST")
+    print(f"{EXPERIMENT_NAME}")
     print("=" * 60)
-    print(f"Strategy          : VWAP + Momentum + Volume Breakout v1")
-    print(f"Mode              : Shared-account historical backtest")
+    print(f"Strategy          : {STRATEGY_NAME}")
+    print("Mode              : Shared-account historical backtest")
     print(f"Capital           : ₹{settings.capital:,.2f}")
     print(f"Stocks            : {len(symbols)}")
     print(f"Interval          : {interval}")
@@ -251,7 +256,7 @@ def run(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run Experiment #001 portfolio backtest."
+        description="Run Strategy #002 portfolio backtest."
     )
 
     parser.add_argument(

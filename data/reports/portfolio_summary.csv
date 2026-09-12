@@ -1,0 +1,2 @@
+strategy,mode,starting_capital,ending_capital,total_trades,wins,losses,win_rate_pct,gross_pnl,total_cost,net_pnl,return_pct,expectancy_per_trade,average_winner,average_loser,payoff_ratio,profit_factor,max_drawdown,max_drawdown_pct,rejected_signals
+VWAP + Momentum + Volume Breakout v1,Portfolio historical backtest,50000.0,48799.79131167013,50,9,41,18.0,-269.05000000000643,931.1586883298628,-1200.2086883298693,-2.4004173766597385,-24.004173766597386,29.058999664670832,-35.65218744663188,0.815069193388752,0.17891762781704312,-1202.8964830356563,-2.406192895074419,80
